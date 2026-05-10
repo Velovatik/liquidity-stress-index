@@ -37,12 +37,28 @@ docker-compose up --build
 
 Контейнер приложения **ждёт Postgres**, применяет `migrations/init.sql`, выполняет **ETL один раз**, затем поднимает HTTP на **`http://localhost:8080`**.
 
+### Production-like поведение (env)
+
+- `CSV_PATH`: путь к CSV (если пусто — используется/создаётся `data/liquidity.csv`)
+- `ETL_INTERVAL`: периодический запуск ETL, например `30s`, `5m` (если пусто — ETL только при старте)
+- `DATABASE_URL`, `LISTEN_ADDR`, `APP_ROOT`: как раньше
+
+## Метрики (Prometheus + Grafana)
+
+Приложение экспортирует Prometheus-метрики на `GET /metrics` (порт `8080`).
+
+В Compose добавлены:
+
+- Prometheus: `http://localhost:9090` (скрейпит `app:8080/metrics`)
+- Grafana: `http://localhost:3000` (логин/пароль по умолчанию `admin` / `admin`), datasource Prometheus подключён автоматически
+
 ### Быстрая проверка
 
 ```bash
 curl -s http://localhost:8080/health
 curl -s http://localhost:8080/lsi/latest | jq
 curl -s http://localhost:8080/lsi/history | jq
+curl -s http://localhost:8080/metrics | head
 ```
 
 `GET /lsi/latest` отвечает `{ "lsi": <float>, "date": "YYYY-MM-DD" }`.  
@@ -61,7 +77,7 @@ migrations/init.sql       # таблица и индекс
 Dockerfile / docker-compose.yml
 ```
 
-При каждом старте логически **очищаем** таблицу (`DELETE FROM lsi_data`) перед повторной загрузкой CSV, чтобы можно было снова поднять Compose без ручной чистки.
+Загрузка стала **идемпотентной**: ETL пишет данные через **UPSERT по `date`**, а при наличии данных в БД загружает только **новые даты** из CSV.
 
 Если `data/liquidity.csv` отсутствует, приложение восстанавливает детерминированный файл при старте через `EnsureLiquidityCSV`.
 

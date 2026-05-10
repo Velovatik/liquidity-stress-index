@@ -25,22 +25,37 @@ type DB struct {
 	*pgxpool.Pool
 }
 
-// ClearLSIData удаляет строки перед новой загрузкой ETL (упрощение для демо).
-func (db *DB) ClearLSIData(ctx context.Context) error {
-	_, err := db.Exec(ctx, `DELETE FROM lsi_data`)
-	return err
+// LatestDate возвращает максимальную дату, загруженную в lsi_data.
+// Если таблица пуста — ok=false.
+func (db *DB) LatestDate(ctx context.Context) (date time.Time, ok bool, err error) {
+	const q = `SELECT max(date) FROM lsi_data`
+	var d *time.Time
+	if err := db.QueryRow(ctx, q).Scan(&d); err != nil {
+		return time.Time{}, false, err
+	}
+	if d == nil {
+		return time.Time{}, false, nil
+	}
+	return d.UTC().Truncate(24 * time.Hour), true, nil
 }
 
-// InsertRows пакетно вставляет нормализованные строки с LSI.
-func (db *DB) InsertRows(ctx context.Context, rows []Row) error {
-	const insertSQL = `
+// UpsertRows пакетно вставляет/обновляет строки (идемпотентная загрузка по date).
+func (db *DB) UpsertRows(ctx context.Context, rows []Row) error {
+	const upsertSQL = `
 INSERT INTO lsi_data (date, bank_reserves, repo_rate, ofz_yield, tax_pressure, treasury_balance, lsi)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (date) DO UPDATE SET
+  bank_reserves = EXCLUDED.bank_reserves,
+  repo_rate = EXCLUDED.repo_rate,
+  ofz_yield = EXCLUDED.ofz_yield,
+  tax_pressure = EXCLUDED.tax_pressure,
+  treasury_balance = EXCLUDED.treasury_balance,
+  lsi = EXCLUDED.lsi
 `
 
 	batch := &pgx.Batch{}
 	for _, r := range rows {
-		batch.Queue(insertSQL,
+		batch.Queue(upsertSQL,
 			r.Date.UTC().Truncate(24*time.Hour),
 			r.BankReserves,
 			r.RepoRate,
@@ -56,7 +71,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
 
 	for range rows {
 		if _, err := res.Exec(); err != nil {
-			return fmt.Errorf("пакетная вставка: %w", err)
+			return fmt.Errorf("пакетная вставка/upsert: %w", err)
 		}
 	}
 	return nil

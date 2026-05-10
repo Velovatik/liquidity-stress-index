@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Многостадийная сборка демо-сервиса LSI (Go 1.22, статический бинарник).
-FROM golang:1.22-alpine AS build
+# Многостадийная сборка демо-сервиса LSI (Go 1.23, статический бинарник).
+FROM golang:1.23-alpine AS build
 WORKDIR /src
 
 RUN apk add --no-cache ca-certificates

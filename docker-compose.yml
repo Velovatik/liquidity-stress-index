@@ -27,6 +27,31 @@ services:
       DATABASE_URL: postgres://lsi:lsi@postgres:5432/lsi?sslmode=disable
       APP_ROOT: /app
       LISTEN_ADDR: ":8080"
+      # ETL_INTERVAL: "5m" # раскомментируйте для периодического ETL
+      # CSV_PATH: "/app/data/liquidity.csv"
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - app
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - lsi_grafana:/var/lib/grafana
 
 volumes:
   lsi_pgdata:
+  lsi_grafana:

@@ -31,35 +31,63 @@ type ParsedRow struct {
 
 // RunPipeline — один синхронный проход: CSV → расчёт LSI → Postgres.
 func RunPipeline(ctx context.Context, csvPath string, db *storage.DB) error {
-	raw, err := readCSV(csvPath)
+	all, err := readCSV(csvPath)
 	if err != nil {
 		return fmt.Errorf("чтение csv: %w", err)
 	}
-	if len(raw) == 0 {
+	if len(all) == 0 {
 		return fmt.Errorf("в %s нет строк данных", csvPath)
 	}
 
+	// Инкрементальная загрузка: если в БД уже есть данные, перезагружаем только новые даты.
+	// Нормализация считается по всему окну CSV, чтобы шкала LSI была стабильна между прогонами.
+	// Вставка при этом остаётся инкрементальной/идемпотентной (грузим только новые даты).
+	raw := all
+	if last, ok, err := db.LatestDate(ctx); err != nil {
+		return fmt.Errorf("чтение последней даты в БД: %w", err)
+	} else if ok {
+		raw = filterAfterDate(all, last)
+		if len(raw) == 0 {
+			return nil
+		}
+	}
+
+	// Нормализуем по полному CSV-окну (all), но LSI считаем/пишем только для raw (новые даты).
 	normalizedWeights := [][]float64{
-		columnValues(raw, func(r ParsedRow) float64 { return r.BankReserves }),
-		columnValues(raw, func(r ParsedRow) float64 { return r.RepoRate }),
-		columnValues(raw, func(r ParsedRow) float64 { return r.OFZYield }),
-		columnValues(raw, func(r ParsedRow) float64 { return r.TaxPressure }),
-		columnValues(raw, func(r ParsedRow) float64 { return r.TreasuryBalance }),
+		columnValues(all, func(r ParsedRow) float64 { return r.BankReserves }),
+		columnValues(all, func(r ParsedRow) float64 { return r.RepoRate }),
+		columnValues(all, func(r ParsedRow) float64 { return r.OFZYield }),
+		columnValues(all, func(r ParsedRow) float64 { return r.TaxPressure }),
+		columnValues(all, func(r ParsedRow) float64 { return r.TreasuryBalance }),
 	}
 
 	// Для буферов ликвидности инвертируем: меньше резервов / меньше казначейство → выше стресс.
 	invertMask := []bool{true, false, false, false, true}
 
-	normcols := make([][]float64, len(invertMask))
+	normcolsAll := make([][]float64, len(invertMask))
 	for i := range invertMask {
-		normcols[i] = normalizeMinMax(normalizedWeights[i], invertMask[i])
+		normcolsAll[i] = normalizeMinMax(normalizedWeights[i], invertMask[i])
+	}
+
+	// Индекс соответствия: date -> индекс строки в all.
+	// Временная зона/округление синхронизированы с тем, как храним date в БД.
+	idxByDate := make(map[time.Time]int, len(all))
+	for i := range all {
+		d := all[i].Date.UTC().Truncate(24 * time.Hour)
+		idxByDate[d] = i
 	}
 
 	rows := make([]storage.Row, len(raw))
 	for i := range raw {
+		key := raw[i].Date.UTC().Truncate(24 * time.Hour)
+		allIdx, ok := idxByDate[key]
+		if !ok {
+			return fmt.Errorf("внутренняя ошибка: дата %s отсутствует в полном наборе CSV", key.Format(time.DateOnly))
+		}
+
 		sum := 0.0
-		for j := 0; j < len(normcols); j++ {
-			sum += weightsPerMetric * normcols[j][i]
+		for j := 0; j < len(normcolsAll); j++ {
+			sum += weightsPerMetric * normcolsAll[j][allIdx]
 		}
 		lsi := 100 * sum // веса в сумме 1.0, нормализованные члены в [0,1]
 
@@ -74,10 +102,7 @@ func RunPipeline(ctx context.Context, csvPath string, db *storage.DB) error {
 		}
 	}
 
-	if err := db.ClearLSIData(ctx); err != nil {
-		return fmt.Errorf("очистка таблицы: %w", err)
-	}
-	if err := db.InsertRows(ctx, rows); err != nil {
+	if err := db.UpsertRows(ctx, rows); err != nil {
 		return fmt.Errorf("вставка строк: %w", err)
 	}
 
@@ -86,6 +111,18 @@ func RunPipeline(ctx context.Context, csvPath string, db *storage.DB) error {
 
 func clamp(v, low, high float64) float64 {
 	return math.Min(high, math.Max(low, v))
+}
+
+func filterAfterDate(rows []ParsedRow, after time.Time) []ParsedRow {
+	after = after.UTC().Truncate(24 * time.Hour)
+	out := rows[:0]
+	for _, r := range rows {
+		d := r.Date.UTC().Truncate(24 * time.Hour)
+		if d.After(after) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func columnValues(rows []ParsedRow, pick func(ParsedRow) float64) []float64 {

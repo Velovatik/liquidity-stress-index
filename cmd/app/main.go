@@ -6,11 +6,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"liquidity-stress-index/internal/api"
 	"liquidity-stress-index/internal/etl"
+	"liquidity-stress-index/internal/metrics"
 	"liquidity-stress-index/internal/storage"
 )
 
@@ -21,7 +25,8 @@ func main() {
 }
 
 func run() error {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	root, err := projectRoot()
 	if err != nil {
@@ -43,23 +48,80 @@ func run() error {
 		return err
 	}
 
-	csvPath, err := etl.EnsureLiquidityCSV(root)
-	if err != nil {
-		return fmt.Errorf("подготовка liquidity.csv: %w", err)
+	csvPath := getenv("CSV_PATH", "")
+	if strings.TrimSpace(csvPath) == "" {
+		csvPath, err = etl.EnsureLiquidityCSV(root)
+		if err != nil {
+			return fmt.Errorf("подготовка liquidity.csv: %w", err)
+		}
 	}
 
-	if err := etl.RunPipeline(ctx, csvPath, db); err != nil {
-		return fmt.Errorf("конвейер ETL: %w", err)
+	etlInterval, err := parseDurationEnv("ETL_INTERVAL", "")
+	if err != nil {
+		return err
+	}
+
+	state := &api.ETLState{}
+	runETL := func() {
+		start := time.Now().UTC()
+		state.SetRunning(start)
+		if err := etl.RunPipeline(ctx, csvPath, db); err != nil {
+			state.SetFailed(time.Now().UTC(), err)
+			metrics.ObserveETLError(time.Since(start))
+			log.Printf("ETL ошибка: %v", err)
+			return
+		}
+		state.SetSucceeded(time.Now().UTC())
+		metrics.ObserveETLSuccess(time.Since(start))
+	}
+
+	// Первый прогон — синхронно: так API не отдаст “пусто”, если данных реально нет.
+	runETL()
+
+	var wg sync.WaitGroup
+	if etlInterval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(etlInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					runETL()
+				}
+			}
+		}()
 	}
 
 	addr := getenv("LISTEN_ADDR", ":8080")
 	log.Printf("демо API LSI слушает %s\n", addr)
+	handler := metrics.InstrumentHandler(api.NewMux(db, state))
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewMux(db),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	return srv.ListenAndServe()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		wg.Wait()
+		return nil
+	case err := <-errCh:
+		if err == http.ErrServerClosed {
+			wg.Wait()
+			return nil
+		}
+		return err
+	}
 }
 
 func projectRoot() (string, error) {
@@ -78,6 +140,21 @@ func getenv(k, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func parseDurationEnv(k, fallback string) (time.Duration, error) {
+	raw := getenv(k, fallback)
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s должен быть duration (например 30s, 5m), получили %q: %w", k, raw, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s не может быть отрицательным: %q", k, raw)
+	}
+	return d, nil
 }
 
 func applyMigrations(ctx context.Context, db *storage.DB) error {

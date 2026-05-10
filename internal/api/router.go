@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"liquidity-stress-index/internal/storage"
 )
@@ -18,15 +21,96 @@ type lsijson struct {
 	Date string  `json:"date"`
 }
 
+type ETLState struct {
+	mu        sync.RWMutex
+	running   bool
+	lastStart time.Time
+	lastEnd   time.Time
+	lastOK    bool
+	lastErr   string
+}
+
+func (s *ETLState) SetRunning(start time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running = true
+	s.lastStart = start
+}
+
+func (s *ETLState) SetSucceeded(end time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running = false
+	s.lastEnd = end
+	s.lastOK = true
+	s.lastErr = ""
+}
+
+func (s *ETLState) SetFailed(end time.Time, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running = false
+	s.lastEnd = end
+	s.lastOK = false
+	if err != nil {
+		s.lastErr = err.Error()
+	} else {
+		s.lastErr = "unknown error"
+	}
+}
+
+type etlStateJSON struct {
+	Running   bool   `json:"running"`
+	LastStart string `json:"last_start,omitempty"`
+	LastEnd   string `json:"last_end,omitempty"`
+	LastOK    *bool  `json:"last_ok,omitempty"`
+	LastErr   string `json:"last_err,omitempty"`
+}
+
+func (s *ETLState) snapshot() etlStateJSON {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := etlStateJSON{Running: s.running}
+	if !s.lastStart.IsZero() {
+		out.LastStart = formatDateTime(s.lastStart)
+	}
+	if !s.lastEnd.IsZero() {
+		out.LastEnd = formatDateTime(s.lastEnd)
+	}
+	if !s.lastStart.IsZero() || !s.lastEnd.IsZero() {
+		v := s.lastOK
+		out.LastOK = &v
+	}
+	if s.lastErr != "" {
+		out.LastErr = s.lastErr
+	}
+	return out
+}
+
+func formatDateTime(ts time.Time) string {
+	return ts.UTC().Format(time.RFC3339)
+}
+
 // NewMux регистрирует HTTP-эндпоинты демо на стандартном net/http.
-func NewMux(db *storage.DB) http.Handler {
+func NewMux(db *storage.DB, etlState *ETLState) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
-	})
+	mux.Handle("GET /metrics", promhttp.Handler())
+
+	mux.HandleFunc("GET /health", wrap(func(ctx context.Context, w http.ResponseWriter, _ *http.Request) error {
+		pingCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		defer cancel()
+		if err := db.Ping(pingCtx); err != nil {
+			return fmt.Errorf("db ping: %w", err)
+		}
+		payload := map[string]any{
+			"ok":  true,
+			"db":  "ok",
+			"etl": etlState.snapshot(),
+		}
+		writeJSON(w, http.StatusOK, payload)
+		return nil
+	}))
 
 	mux.HandleFunc("GET /lsi/latest", wrap(func(ctx context.Context, w http.ResponseWriter, _ *http.Request) error {
 		rec, err := db.LatestLSI(ctx)
